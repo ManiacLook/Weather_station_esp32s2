@@ -16,6 +16,7 @@
 
 #include "lwip/err.h"
 #include "lwip/sys.h"
+#include "lwip/apps/sntp.h"
 
 #include "esp_http_client.h"
 #include "cJSON.h"
@@ -26,8 +27,8 @@
 #define EXAMPLE_ESP_MAXIMUM_RETRY  5					// wifi连接失败以后可以重新连接的次数
 #define WIFI_CONNECTED_BIT BIT0                         // wifi连接成功标志位
 #define WIFI_FAIL_BIT      BIT1							// wifi连接失败标志位
-
-#define MAX_HTTP_OUTPUT_BUFFER 2048                     // HTTP接收数据大小s
+#define MAX_HTTP_OUTPUT_BUFFER 2048                     // HTTP接收数据大小
+#define WEATHER_API "https://api.seniverse.com/v3/weather/now.json?key=your_api_key&location=Wuhan&language=en&unit=c"
 
 // 定义LCD相关的宏
 #define PIN_NUM_MISO -1  // 主设备输入，从设备输出
@@ -39,7 +40,7 @@
 
 // 定义联网所需要的变量
 static EventGroupHandle_t s_wifi_event_group;   // 事件组，用于对wifi响应结果进行标记
-static const char* TAG = "wifi station";        // log标志位
+static const char* TAG = "weather station";        // log标志位
 static int s_retry_num = 0;                     // 记录wifi重新连接尝试的次数
 
 // 定义LCD相关的变量
@@ -363,6 +364,90 @@ void wifi_init_sta(void)
     vEventGroupDelete(s_wifi_event_group);
 }
 
+static void esp_initialize_sntp(void)
+{
+    ESP_LOGI(TAG, "Initializing SNTP");
+    sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    sntp_setservername(0, "ntp1.aliyun.com");
+
+    sntp_init();
+}
+
+void esp_wait_sntp_sync(void)
+{
+    char strftime_buf[64];
+    esp_initialize_sntp();
+
+    // wait for time to be set
+    time_t now = 0;
+    struct tm timeinfo = { 0 };
+    int retry = 0;
+
+    while (timeinfo.tm_year < (2019 - 1900)) {
+        ESP_LOGD(TAG, "Waiting for system time to be set... (%d)", ++retry);
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+        time(&now);
+        localtime_r(&now, &timeinfo);
+    }
+
+    // set timezone to China Standard Time
+    setenv("TZ", "CST-8", 1);
+    tzset();
+
+    strftime(strftime_buf, sizeof(strftime_buf), "%c", &timeinfo);
+    ESP_LOGI(TAG, "The current date/time in Shanghai is: %s", strftime_buf);
+}
+
+// 获得实时时间
+void display_time(void)
+{
+    // 死循环防止出现返回值，从而导致freertos报错
+    while (1)
+    {
+        time_t now;
+        char strftime_buf[64];
+        struct tm timeinfo;
+
+        time(&now);
+        // Set timezone to China Standard Time
+        setenv("TZ", "CST-8", 1);
+        tzset();
+
+        localtime_r(&now, &timeinfo);
+        strftime(strftime_buf, sizeof(strftime_buf), "%Y-%m-%d %H-%M-%S", &timeinfo);
+        ESP_LOGI(TAG, "The current date/time in Shanghai is: %s", strftime_buf);
+
+        oled_string(0, 50, strftime_buf, 12);
+        oled_refresh();
+        
+        vTaskDelay(300 / portTICK_RATE_MS);
+    }
+}
+
+void display_weather(char output_buffer[])
+{
+    cJSON* root = NULL;                 // 头指针
+    root = cJSON_Parse(output_buffer);  // 解析整段JSON数据
+    // 逐层解析键值对
+    cJSON* cjson_item = cJSON_GetObjectItem(root, "results");
+    cJSON* cjson_results = cJSON_GetArrayItem(cjson_item, 0);
+    cJSON* cjson_now = cJSON_GetObjectItem(cjson_results, "now");
+    cJSON* cjson_temperature = cJSON_GetObjectItem(cjson_now, "temperature");
+    cJSON* cjson_text = cJSON_GetObjectItem(cjson_now, "text");
+    cJSON* cjson_time = cJSON_GetObjectItem(cjson_results, "last_update");
+
+    printf("weather:%s\n", cjson_text->valuestring);
+    printf("temperature:%s\n", cjson_temperature->valuestring);
+
+    char str[80];
+    sprintf(str, "temperature:%s", cjson_temperature->valuestring);
+    oled_string(0, 35, str, 12);
+    sprintf(str, "weather:%s", cjson_text->valuestring);
+    oled_string(0, 20, str, 12);
+    
+    vTaskDelay(1000 / portTICK_RATE_MS);
+}
+
 static void http_test_task(void *pvParameters)
 {
     // 02-1 定义需要的变量
@@ -375,7 +460,7 @@ static void http_test_task(void *pvParameters)
     memset(&config, 0, sizeof(config));
 
     // 向配置结构体内部写入url(心知天气API接口地址)
-    static const char *URL = "https://api.seniverse.com/v3/weather/now.json?key=your_api_key&location=Wuhan&language=en&unit=c";
+    static const char *URL = WEATHER_API;
     config.url = URL;
 
     // 初始化结构体
@@ -383,6 +468,8 @@ static void http_test_task(void *pvParameters)
 
     // 设置发送get请求
     esp_http_client_set_method(client, HTTP_METHOD_GET);
+
+    bool last = false, cur = false;
 
     // 02-3 循环通讯
     while(1)
@@ -394,10 +481,18 @@ static void http_test_task(void *pvParameters)
         if (err != ESP_OK)
         {
             ESP_LOGE(TAG, "Failed to open HTTP connection: %s", esp_err_to_name(err));
+
+            cur = false;
+            if (last)   oled_clear();  // 连接成功变为连接失败
+            last = false;
         } 
         // 连接成功
         else
         {
+            cur = true;
+            if (!last)  oled_clear();  // 连接失败变为连接成功
+            last = true;
+
             // 读取目标主机的返回内容的协议头长度
             content_length = esp_http_client_fetch_headers(client);
 
@@ -420,26 +515,7 @@ static void http_test_task(void *pvParameters)
                         esp_http_client_get_content_length(client));			// 获取响应信息长度
                     printf("data:%s\n", output_buffer);
                     // 对接收到的数据作相应的处理
-                    cJSON* root = NULL;                 // 头指针
-                    root = cJSON_Parse(output_buffer);  // 解析整段JSON数据
-                    // 逐层解析键值对
-                    cJSON* cjson_item = cJSON_GetObjectItem(root, "results");
-                    cJSON* cjson_results = cJSON_GetArrayItem(cjson_item, 0);
-                    cJSON* cjson_now = cJSON_GetObjectItem(cjson_results, "now");
-                    cJSON* cjson_temperature = cJSON_GetObjectItem(cjson_now, "temperature");
-                    cJSON* cjson_text = cJSON_GetObjectItem(cjson_now, "text");
-                
-                    printf("weather:%s\n", cjson_text->valuestring);
-                    printf("temperature:%s\n", cjson_temperature->valuestring);
-
-                    oled_clear();
-                    char str[80];
-                    sprintf(str, "temperature:%s", cjson_temperature->valuestring);
-                    oled_string(10, 50, str, 12);
-                    sprintf(str, "weather:%s", cjson_text->valuestring);
-                    oled_string(10, 30, str, 12);
-                    oled_refresh();
-                    vTaskDelay(1000 / portTICK_RATE_MS);
+                    display_weather(output_buffer);
                 }
                 // 如果不成功
                 else
@@ -475,6 +551,10 @@ void app_main(void)
     ESP_LOGI(TAG, "ESP_WIFI_MODE_STA");
     wifi_init_sta();
 
+    // 时间同步
+    esp_wait_sntp_sync();
+
     // 创建进程，用于处理http通讯
     xTaskCreate(&http_test_task, "http_test_task", 8192, NULL, 5, NULL);
+    xTaskCreate(&display_time, "display_time", 8192, NULL, 4, NULL);
 }
