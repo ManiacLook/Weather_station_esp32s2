@@ -28,7 +28,7 @@
 #define WIFI_CONNECTED_BIT BIT0                         // wifi连接成功标志位
 #define WIFI_FAIL_BIT      BIT1							// wifi连接失败标志位
 #define MAX_HTTP_OUTPUT_BUFFER 2048                     // HTTP接收数据大小
-#define WEATHER_API "https://api.seniverse.com/v3/weather/now.json?key=your_api_key&location=Wuhan&language=en&unit=c"
+#define WEATHER_API "https://api.seniverse.com/v3/weather/now.json?key=your_key&location=ip&language=en&unit=c"
 
 // 定义LCD相关的宏
 #define PIN_NUM_MISO -1  // 主设备输入，从设备输出
@@ -40,7 +40,7 @@
 
 // 定义联网所需要的变量
 static EventGroupHandle_t s_wifi_event_group;   // 事件组，用于对wifi响应结果进行标记
-static const char* TAG = "weather station";        // log标志位
+static const char* TAG = "weather station";     // log标志位
 static int s_retry_num = 0;                     // 记录wifi重新连接尝试的次数
 
 // 定义LCD相关的变量
@@ -414,7 +414,7 @@ void display_time(void)
         tzset();
 
         localtime_r(&now, &timeinfo);
-        strftime(strftime_buf, sizeof(strftime_buf), "%Y-%m-%d %H-%M-%S", &timeinfo);
+        strftime(strftime_buf, sizeof(strftime_buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
         ESP_LOGI(TAG, "The current date/time in Shanghai is: %s", strftime_buf);
 
         oled_string(0, 50, strftime_buf, 12);
@@ -434,7 +434,6 @@ void display_weather(char output_buffer[])
     cJSON* cjson_now = cJSON_GetObjectItem(cjson_results, "now");
     cJSON* cjson_temperature = cJSON_GetObjectItem(cjson_now, "temperature");
     cJSON* cjson_text = cJSON_GetObjectItem(cjson_now, "text");
-    cJSON* cjson_time = cJSON_GetObjectItem(cjson_results, "last_update");
 
     printf("weather:%s\n", cjson_text->valuestring);
     printf("temperature:%s\n", cjson_temperature->valuestring);
